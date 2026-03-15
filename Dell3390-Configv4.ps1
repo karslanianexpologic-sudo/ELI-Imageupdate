@@ -1,0 +1,352 @@
+#Requires -RunAsAdministrator
+<#
+.SYNOPSIS
+    Dell 3390 2-in-1 Windows 11 Master Configuration Script
+.DESCRIPTION
+    1. Renames PC to BIOS Asset Tag
+    2. Sets Screen, Sleep, Hard Disk, and Hibernate timeout to Never (AC and Battery)
+    3. Disables Windows Update service (wuauserv)
+    4. Disables Windows Update Medic Service (WaaSMedicSvc)
+    5. Sets enforced Desktop Background image
+    6. Sets enforced Lock Screen image and configures lock screen settings
+    7. Prompts for restart
+#>
+
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host "   Dell 3390 Configuration Script v4" -ForegroundColor Cyan
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host ""
+
+# ─────────────────────────────────────────────
+# 1. RENAME PC TO BIOS ASSET TAG
+# ─────────────────────────────────────────────
+Write-Host "--- TASK 1: Rename PC to BIOS Asset Tag ---" -ForegroundColor Cyan
+Write-Host ""
+
+$candidates = [ordered]@{}
+
+try { $candidates["Win32_SystemEnclosure.SMBIOSAssetTag"] = (Get-WmiObject -Class Win32_SystemEnclosure).SMBIOSAssetTag } catch { $candidates["Win32_SystemEnclosure.SMBIOSAssetTag"] = "(query failed)" }
+try { $candidates["Win32_ComputerSystemProduct.IdentifyingNumber"] = (Get-WmiObject -Class Win32_ComputerSystemProduct).IdentifyingNumber } catch { $candidates["Win32_ComputerSystemProduct.IdentifyingNumber"] = "(query failed)" }
+try { $candidates["Win32_BIOS.SerialNumber"] = (Get-WmiObject -Class Win32_BIOS).SerialNumber } catch { $candidates["Win32_BIOS.SerialNumber"] = "(query failed)" }
+
+foreach ($key in $candidates.Keys) {
+    $val = $candidates[$key]
+    $color = if ([string]::IsNullOrWhiteSpace($val) -or $val -match "No Asset Tag|Default string|To be filled|Not Specified|\(query failed\)") { "Red" } else { "Green" }
+    Write-Host "  $key" -ForegroundColor White
+    Write-Host "    Value: '$val'" -ForegroundColor $color
+    Write-Host ""
+}
+
+$invalidPatterns = "No Asset Tag|Default string|To be filled|Not Specified|^\s*$"
+$assetTag = $null
+
+foreach ($key in $candidates.Keys) {
+    $val = $candidates[$key]
+    if (-not [string]::IsNullOrWhiteSpace($val) -and $val -notmatch $invalidPatterns -and $val -ne "(query failed)") {
+        $assetTag = $val.Trim()
+        Write-Host "Using value from: $key --> '$assetTag'" -ForegroundColor Cyan
+        Write-Host ""
+        break
+    }
+}
+
+if ($null -eq $assetTag) {
+    Write-Host "ERROR: No valid Asset Tag found. Skipping rename." -ForegroundColor Red
+} else {
+    $currentName = $env:COMPUTERNAME
+    if ($currentName -eq $assetTag) {
+        Write-Host "Computer is already named '$assetTag'. Nothing to do." -ForegroundColor Green
+    } else {
+        try {
+            Rename-Computer -NewName $assetTag -Force -ErrorAction Stop
+            Write-Host "SUCCESS: Computer will be renamed to '$assetTag' on next reboot." -ForegroundColor Green
+        } catch {
+            Write-Host "ERROR: Failed to rename computer." -ForegroundColor Red
+            Write-Host $_.Exception.Message -ForegroundColor Red
+        }
+    }
+}
+
+Write-Host ""
+
+# ─────────────────────────────────────────────
+# 2. SET ALL POWER TIMEOUTS TO NEVER
+# ─────────────────────────────────────────────
+Write-Host "--- TASK 2: Set All Power Timeouts to Never ---" -ForegroundColor Cyan
+Write-Host ""
+
+try {
+    powercfg /change monitor-timeout-ac 0
+    powercfg /change monitor-timeout-dc 0
+    Write-Host "SUCCESS: Screen timeout set to Never (AC and Battery)." -ForegroundColor Green
+
+    powercfg /change standby-timeout-ac 0
+    powercfg /change standby-timeout-dc 0
+    Write-Host "SUCCESS: Sleep timeout set to Never (AC and Battery)." -ForegroundColor Green
+
+    powercfg /change disk-timeout-ac 0
+    powercfg /change disk-timeout-dc 0
+    Write-Host "SUCCESS: Hard disk timeout set to Never (AC and Battery)." -ForegroundColor Green
+
+    powercfg /change hibernate-timeout-ac 0
+    powercfg /change hibernate-timeout-dc 0
+    Write-Host "SUCCESS: Hibernate timeout set to Never (AC and Battery)." -ForegroundColor Green
+
+} catch {
+    Write-Host "ERROR: Failed to set one or more power timeouts." -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+}
+
+Write-Host ""
+
+# ─────────────────────────────────────────────
+# 3. DISABLE WINDOWS UPDATE SERVICE (wuauserv)
+# ─────────────────────────────────────────────
+Write-Host "--- TASK 3: Disable Windows Update Service ---" -ForegroundColor Cyan
+Write-Host ""
+
+try {
+    Stop-Service -Name wuauserv -Force -ErrorAction SilentlyContinue
+    Set-Service -Name wuauserv -StartupType Disabled -ErrorAction Stop
+    Write-Host "SUCCESS: Windows Update service (wuauserv) disabled." -ForegroundColor Green
+} catch {
+    Write-Host "WARNING: Set-Service failed, trying registry fallback..." -ForegroundColor Yellow
+    try {
+        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\wuauserv" -Name "Start" -Value 4 -Type DWord -Force
+        Write-Host "SUCCESS: Windows Update service disabled via registry." -ForegroundColor Green
+    } catch {
+        Write-Host "ERROR: Failed to disable Windows Update service." -ForegroundColor Red
+        Write-Host $_.Exception.Message -ForegroundColor Red
+    }
+}
+
+Write-Host ""
+
+# ─────────────────────────────────────────────
+# 4. DISABLE WINDOWS UPDATE MEDIC SERVICE
+# ─────────────────────────────────────────────
+Write-Host "--- TASK 4: Disable Windows Update Medic Service ---" -ForegroundColor Cyan
+Write-Host ""
+
+$medicRegPath    = "HKLM:\SYSTEM\CurrentControlSet\Services\WaaSMedicSvc"
+$medicRegPathRaw = "SYSTEM\CurrentControlSet\Services\WaaSMedicSvc"
+$success = $false
+
+try {
+    Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using Microsoft.Win32;
+
+public class RegOwnership {
+    [DllImport("advapi32.dll", SetLastError=true)]
+    static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+    [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Auto)]
+    static extern bool LookupPrivilegeValue(string lpSystemName, string lpName, out LUID lpLuid);
+    [DllImport("advapi32.dll", SetLastError=true)]
+    static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges,
+        ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LUID { public uint LowPart; public int HighPart; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct TOKEN_PRIVILEGES { public uint PrivilegeCount; public LUID Luid; public uint Attributes; }
+    public static void EnableTakeOwnership() {
+        IntPtr token;
+        OpenProcessToken(System.Diagnostics.Process.GetCurrentProcess().Handle, 0x0020 | 0x0008, out token);
+        LUID luid;
+        LookupPrivilegeValue(null, "SeTakeOwnershipPrivilege", out luid);
+        TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES();
+        tp.PrivilegeCount = 1; tp.Luid = luid; tp.Attributes = 0x00000002;
+        AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+    }
+}
+"@
+
+    [RegOwnership]::EnableTakeOwnership()
+
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+        $medicRegPathRaw,
+        [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+        [System.Security.AccessControl.RegistryRights]::TakeOwnership
+    )
+    $acl = $key.GetAccessControl([System.Security.AccessControl.AccessControlSections]::None)
+    $adminSID = New-Object System.Security.Principal.SecurityIdentifier(
+        [System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null
+    )
+    $acl.SetOwner($adminSID)
+    $key.SetAccessControl($acl)
+
+    $key2 = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+        $medicRegPathRaw,
+        [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree,
+        [System.Security.AccessControl.RegistryRights]::ChangePermissions
+    )
+    $acl2 = $key2.GetAccessControl()
+    $rule = New-Object System.Security.AccessControl.RegistryAccessRule(
+        $adminSID,
+        [System.Security.AccessControl.RegistryRights]::FullControl,
+        [System.Security.AccessControl.InheritanceFlags]::ContainerInherit,
+        [System.Security.AccessControl.PropagationFlags]::None,
+        [System.Security.AccessControl.AccessControlType]::Allow
+    )
+    $acl2.SetAccessRule($rule)
+    $key2.SetAccessControl($acl2)
+
+    Set-ItemProperty -Path $medicRegPath -Name "Start" -Value 4 -Type DWord -Force -ErrorAction Stop
+    Write-Host "SUCCESS: WaaSMedicSvc disabled via registry ownership." -ForegroundColor Green
+    $success = $true
+
+} catch {
+    Write-Host "WARNING: Ownership method failed. Trying sc.exe fallback..." -ForegroundColor Yellow
+    try {
+        sc.exe sdset WaaSMedicSvc "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)" | Out-Null
+        Set-ItemProperty -Path $medicRegPath -Name "Start" -Value 4 -Type DWord -Force
+        Write-Host "SUCCESS: WaaSMedicSvc disabled via sc.exe fallback." -ForegroundColor Green
+        $success = $true
+    } catch {
+        Write-Host "ERROR: All methods to disable WaaSMedicSvc failed." -ForegroundColor Red
+        Write-Host $_.Exception.Message -ForegroundColor Red
+    }
+}
+
+Write-Host ""
+
+# ─────────────────────────────────────────────
+# 5. SET ENFORCED DESKTOP BACKGROUND
+# ─────────────────────────────────────────────
+Write-Host "--- TASK 5: Set Enforced Desktop Background ---" -ForegroundColor Cyan
+Write-Host ""
+
+$bgUrl        = "https://raw.githubusercontent.com/karslanianexpologic-sudo/ELI-Imageupdate/ed6b361d1c90e261140929874519801893d53370/Background_MEMS.jpg"
+$bgLocalPath  = "C:\Windows\Web\Wallpaper\ELI\Background_MEMS.jpg"
+
+try {
+    # Create destination folder if it doesn't exist
+    $bgFolder = Split-Path $bgLocalPath
+    if (-not (Test-Path $bgFolder)) {
+        New-Item -ItemType Directory -Path $bgFolder -Force | Out-Null
+    }
+
+    # Download image
+    Write-Host "Downloading background image..." -ForegroundColor White
+    (New-Object Net.WebClient).DownloadFile($bgUrl, $bgLocalPath)
+    Write-Host "  Image saved to $bgLocalPath" -ForegroundColor Green
+
+    # Enforce via registry (prevents users from changing it)
+    $wpRegPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PersonalizationCSP"
+    if (-not (Test-Path $wpRegPath)) {
+        New-Item -Path $wpRegPath -Force | Out-Null
+    }
+    Set-ItemProperty -Path $wpRegPath -Name "DesktopImagePath"   -Value $bgLocalPath -Type String -Force
+    Set-ItemProperty -Path $wpRegPath -Name "DesktopImageUrl"    -Value $bgLocalPath -Type String -Force
+    Set-ItemProperty -Path $wpRegPath -Name "DesktopImageStatus" -Value 1            -Type DWord  -Force
+
+    # Also lock it down so users cannot change it
+    $noChangePath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+    Set-ItemProperty -Path $noChangePath -Name "Wallpaper"          -Value $bgLocalPath -Type String -Force
+    Set-ItemProperty -Path $noChangePath -Name "WallpaperStyle"      -Value "10"         -Type String -Force
+    Set-ItemProperty -Path $noChangePath -Name "NoChangingWallpaper" -Value 1            -Type DWord  -Force
+
+    Write-Host "SUCCESS: Desktop background set and enforced." -ForegroundColor Green
+
+} catch {
+    Write-Host "ERROR: Failed to set desktop background." -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+}
+
+Write-Host ""
+
+# ─────────────────────────────────────────────
+# 6. SET ENFORCED LOCK SCREEN IMAGE + SETTINGS
+# ─────────────────────────────────────────────
+Write-Host "--- TASK 6: Set Enforced Lock Screen Image and Settings ---" -ForegroundColor Cyan
+Write-Host ""
+
+$lsUrl       = "https://raw.githubusercontent.com/karslanianexpologic-sudo/ELI-Imageupdate/ed6b361d1c90e261140929874519801893d53370/NewStationClosed.png"
+$lsLocalPath = "C:\Windows\Web\Screen\ELI\NewStationClosed.png"
+
+try {
+    # Create destination folder if it doesn't exist
+    $lsFolder = Split-Path $lsLocalPath
+    if (-not (Test-Path $lsFolder)) {
+        New-Item -ItemType Directory -Path $lsFolder -Force | Out-Null
+    }
+
+    # Download image
+    Write-Host "Downloading lock screen image..." -ForegroundColor White
+    (New-Object Net.WebClient).DownloadFile($lsUrl, $lsLocalPath)
+    Write-Host "  Image saved to $lsLocalPath" -ForegroundColor Green
+
+    # Set and enforce lock screen image via PersonalizationCSP
+    $lsRegPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\PersonalizationCSP"
+    if (-not (Test-Path $lsRegPath)) {
+        New-Item -Path $lsRegPath -Force | Out-Null
+    }
+    Set-ItemProperty -Path $lsRegPath -Name "LockScreenImagePath"   -Value $lsLocalPath -Type String -Force
+    Set-ItemProperty -Path $lsRegPath -Name "LockScreenImageUrl"    -Value $lsLocalPath -Type String -Force
+    Set-ItemProperty -Path $lsRegPath -Name "LockScreenImageStatus" -Value 1            -Type DWord  -Force
+    Write-Host "SUCCESS: Lock screen image set and enforced." -ForegroundColor Green
+
+    # Disable Windows Spotlight / fun facts / tips on lock screen
+    # 0 = Picture (enforces static image), disables Spotlight
+    $lsPersonPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Personalization"
+    if (-not (Test-Path $lsPersonPath)) {
+        New-Item -Path $lsPersonPath -Force | Out-Null
+    }
+    Set-ItemProperty -Path $lsPersonPath -Name "NoLockScreen"               -Value 0 -Type DWord -Force
+    Set-ItemProperty -Path $lsPersonPath -Name "LockScreenImage"            -Value $lsLocalPath -Type String -Force
+    Set-ItemProperty -Path $lsPersonPath -Name "NoWindowsSpotlight"         -Value 1 -Type DWord -Force
+    Set-ItemProperty -Path $lsPersonPath -Name "NoLockScreenCamera"         -Value 1 -Type DWord -Force
+    Write-Host "SUCCESS: Windows Spotlight / fun facts disabled." -ForegroundColor Green
+
+    # Disable lock screen motion/parallax effect (Make lock screen react when moving PC = Off)
+    $lsMotionPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager"
+    if (-not (Test-Path $lsMotionPath)) {
+        New-Item -Path $lsMotionPath -Force | Out-Null
+    }
+    Set-ItemProperty -Path $lsMotionPath -Name "RotatingLockScreenEnabled"        -Value 0 -Type DWord -Force
+    Set-ItemProperty -Path $lsMotionPath -Name "RotatingLockScreenOverlayEnabled" -Value 0 -Type DWord -Force
+    Set-ItemProperty -Path $lsMotionPath -Name "SubscribedContent-338387Enabled"  -Value 0 -Type DWord -Force
+    Write-Host "SUCCESS: Lock screen motion/parallax effect disabled." -ForegroundColor Green
+
+    # Set Lock Screen Status to None (disable app notifications on lock screen)
+    $lsStatusPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System"
+    if (-not (Test-Path $lsStatusPath)) {
+        New-Item -Path $lsStatusPath -Force | Out-Null
+    }
+    Set-ItemProperty -Path $lsStatusPath -Name "DisableLockScreenAppNotifications" -Value 1 -Type DWord -Force
+    Write-Host "SUCCESS: Lock screen status/notifications set to None." -ForegroundColor Green
+
+    # Show lock screen background on sign-in screen = On
+    $signinRegPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System"
+    Set-ItemProperty -Path $signinRegPath -Name "DisableLogonBackgroundImage" -Value 0 -Type DWord -Force
+    Write-Host "SUCCESS: Lock screen background shown on sign-in screen." -ForegroundColor Green
+
+} catch {
+    Write-Host "ERROR: Failed to configure lock screen." -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+}
+
+Write-Host ""
+
+# ─────────────────────────────────────────────
+# 7. SUMMARY + RESTART PROMPT
+# ─────────────────────────────────────────────
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host "   All Tasks Complete. Reboot Required." -ForegroundColor Cyan
+Write-Host "=============================================" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "Type YES to restart now, or press any other key to restart manually later." -ForegroundColor Yellow
+$confirm = Read-Host "Restart now?"
+
+if ($confirm -eq "YES") {
+    Write-Host "Restarting..." -ForegroundColor Green
+    Start-Sleep -Seconds 3
+    Restart-Computer -Force
+} else {
+    Write-Host "Restart skipped. Please reboot manually to apply all changes." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Press any key to exit..."
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+}
